@@ -4,104 +4,276 @@ on:
   workflow_dispatch:
 
   schedule:
+    # هر 5 ساعت یک Runner جدید
+    # ترتیب اجرا:
+    # 00:00
+    # 05:00
+    # 10:00
+    # 15:00
+    # 20:00
+    # 00:00 روز بعد
+    #
+    # توجه:
+    # GitHub ممکن است Scheduled Workflow را با کمی تأخیر اجرا کند.
     - cron: "0 0,5,10,15,20 * * *"
 
 jobs:
-  rdp:
+  build:
     runs-on: windows-latest
-    timeout-minutes: 350
 
-    env:
-      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+    # GitHub Actions حداکثر اجازه اجرای این Job را می‌دهد.
+    timeout-minutes: 350
 
     steps:
 
-      # -------------------------
-      # Enable Windows RDP
-      # -------------------------
-      - name: Enable RDP
-        shell: powershell
+      # ============================================================
+      # 1. Enable Remote Desktop
+      # ============================================================
+      - name: 1. Enable Remote Desktop & Firewall
+        shell: pwsh
         run: |
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" `
-            -Value 0
+          Write-Host "Enabling Remote Desktop..."
 
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          try {
 
-          Set-ItemProperty `
-            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" `
-            -Value 0
+              Set-ItemProperty `
+                -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                -Name "fDenyTSConnections" `
+                -Value 0 `
+                -ErrorAction Stop
 
+              Enable-NetFirewallRule `
+                -DisplayGroup "Remote Desktop" `
+                -ErrorAction Stop
 
-      # -------------------------
-      # Create RDP User
-      # -------------------------
-      - name: Create RDP User
-        shell: powershell
-        run: |
-          $Password = ConvertTo-SecureString `
-            $Env:RDP_PASSWORD `
-            -AsPlainText `
-            -Force
+              Set-ItemProperty `
+                -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                -Name "UserAuthentication" `
+                -Value 0 `
+                -ErrorAction Stop
 
-          if (Get-LocalUser -Name "NvDAdmin" -ErrorAction SilentlyContinue) {
-              Remove-LocalUser -Name "NvDAdmin"
+              Write-Host "Remote Desktop enabled successfully."
+
+          }
+          catch {
+
+              Write-Error "Failed to enable Remote Desktop: $($_.Exception.Message)"
+              exit 1
           }
 
-          New-LocalUser `
-            -Name "NvDAdmin" `
-            -Password $Password `
-            -PasswordNeverExpires `
-            -AccountNeverExpires
 
-          Add-LocalGroupMember `
-            -Group "Administrators" `
-            -Member "NvDAdmin"
-
-
-      # -------------------------
-      # Install Tailscale
-      # -------------------------
-      - name: Install Tailscale
-        shell: powershell
+      # ============================================================
+      # 2. Create RDP Admin
+      # ============================================================
+      - name: 2. Create Admin Account
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $Installer = "$env:TEMP\tailscale-setup.msi"
 
-          Invoke-WebRequest `
-            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
-            -OutFile $Installer
+          if (-not $Env:RDP_PASSWORD) {
 
-          Start-Process `
-            msiexec.exe `
-            -ArgumentList "/i `"$Installer`" /qn /norestart" `
-            -Wait
+              Write-Error "RDP_PASSWORD secret is missing."
+              exit 1
+          }
+
+          Write-Host "Preparing RDP administrator account..."
+
+          try {
+
+              $Password = ConvertTo-SecureString `
+                $Env:RDP_PASSWORD `
+                -AsPlainText `
+                -Force
+
+          }
+          catch {
+
+              Write-Error "Failed to create secure password."
+              exit 1
+          }
+
+          $ExistingUser = Get-LocalUser `
+            -Name "NvDAdmin" `
+            -ErrorAction SilentlyContinue
+
+          if (-not $ExistingUser) {
+
+              try {
+
+                  New-LocalUser `
+                    -Name "NvDAdmin" `
+                    -Password $Password `
+                    -PasswordNeverExpires `
+                    -AccountNeverExpires `
+                    -Description "Cloud RDP Administrator" `
+                    -ErrorAction Stop
+
+                  Write-Host "NvDAdmin created successfully."
+
+              }
+              catch {
+
+                  Write-Error "Failed to create NvDAdmin: $($_.Exception.Message)"
+                  exit 1
+              }
+
+          }
+          else {
+
+              Write-Host "NvDAdmin already exists."
+
+              # اطمینان از اینکه رمز حساب مطابق Secret فعلی باشد.
+              try {
+
+                  Set-LocalUser `
+                    -Name "NvDAdmin" `
+                    -Password $Password `
+                    -ErrorAction Stop
+
+                  Write-Host "NvDAdmin password updated."
+
+              }
+              catch {
+
+                  Write-Error "Failed to update NvDAdmin password."
+                  exit 1
+              }
+          }
+
+          # اطمینان از وجود حساب در گروه Administrators
+          try {
+
+              Add-LocalGroupMember `
+                -Group "Administrators" `
+                -Member "NvDAdmin" `
+                -ErrorAction SilentlyContinue
+
+          }
+          catch {
+
+              Write-Host "NvDAdmin may already be a member of Administrators."
+          }
+
+          Write-Host "RDP administrator account is ready."
+
+
+      # ============================================================
+      # 3. Install Tailscale
+      # ============================================================
+      - name: 3. Install Tailscale
+        shell: pwsh
+        run: |
+
+          $Installer = "$env:TEMP\tailscale.msi"
+
+          Write-Host "Downloading Tailscale..."
+
+          try {
+
+              Invoke-WebRequest `
+                -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+                -OutFile $Installer `
+                -ErrorAction Stop
+
+          }
+          catch {
+
+              Write-Error "Tailscale download failed: $($_.Exception.Message)"
+              exit 1
+          }
+
+          if (-not (Test-Path $Installer)) {
+
+              Write-Error "Tailscale installer was not found."
+              exit 1
+          }
+
+          Write-Host "Tailscale installer downloaded successfully."
+
+          Write-Host "Installing Tailscale..."
+
+          try {
+
+              $Process = Start-Process `
+                "msiexec.exe" `
+                -ArgumentList "/i `"$Installer`" /quiet /norestart" `
+                -Wait `
+                -PassThru
+
+          }
+          catch {
+
+              Write-Error "Failed to start Tailscale installer."
+              exit 1
+          }
+
+          if ($Process.ExitCode -ne 0) {
+
+              Write-Error "Tailscale installation failed. MSI exit code: $($Process.ExitCode)"
+              exit 1
+          }
 
           Start-Sleep -Seconds 10
 
-
-      # -------------------------
-      # Connect Tailscale
-      # -------------------------
-      - name: Connect Tailscale
-        shell: powershell
-        run: |
           $Tailscale = "C:\Program Files\Tailscale\tailscale.exe"
 
-          if (!(Test-Path $Tailscale)) {
+          if (-not (Test-Path $Tailscale)) {
+
+              Write-Error "Tailscale installation failed. Executable not found."
+              exit 1
+          }
+
+          Write-Host "Tailscale installed successfully."
+
+          Write-Host "Tailscale executable:"
+          Write-Host $Tailscale
+
+
+      # ============================================================
+      # 4. Connect Tailscale
+      # ============================================================
+      - name: 4. Connect Tailscale & Advertise Exit Node
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+
+          $Tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $Tailscale)) {
+
               Write-Error "Tailscale executable not found."
               exit 1
           }
 
-          $Hostname = "github-rdp-$($env:GITHUB_RUN_ID)"
+          if (-not $Env:TAILSCALE_AUTHKEY) {
 
+              Write-Error "TAILSCALE_AUTHKEY secret is missing."
+              exit 1
+          }
+
+          # ========================================================
+          # ساخت hostname منحصر به فرد برای هر GitHub Runner
+          # ========================================================
+
+          $Hostname = "github-rdp-$env:GITHUB_RUN_ID"
+
+          # فقط حروف کوچک، اعداد و -
           $Hostname = $Hostname.ToLower()
           $Hostname = $Hostname -replace '[^a-z0-9-]', ''
           $Hostname = $Hostname.Trim('-')
 
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host "          CONNECTING TO TAILSCALE" -ForegroundColor Cyan
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host ""
+
           Write-Host "Hostname: $Hostname"
+
+          Write-Host ""
+          Write-Host "Connecting to Tailscale..."
 
           & $Tailscale up `
             --authkey="$Env:TAILSCALE_AUTHKEY" `
@@ -109,52 +281,256 @@ jobs:
             --advertise-exit-node
 
           if ($LASTEXITCODE -ne 0) {
+
               Write-Error "Tailscale connection failed."
               exit 1
           }
 
+          Write-Host ""
+          Write-Host "Tailscale connected successfully." -ForegroundColor Green
 
-      # -------------------------
-      # Verify Tailscale
-      # -------------------------
-      - name: Verify Tailscale
-        shell: powershell
-        run: |
-          $Tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+          # صبر برای کامل‌شدن اتصال و دریافت IP
+          Start-Sleep -Seconds 15
 
-          Write-Host "=============================="
-          Write-Host "TAILSCALE STATUS"
-          Write-Host "=============================="
 
-          & $Tailscale status
+          # ========================================================
+          # Get Tailscale IPv4
+          # ========================================================
+
+          $ts_ip = (
+            & $Tailscale ip -4 |
+            Select-Object -First 1
+          ).Trim()
+
+          if (-not $ts_ip) {
+
+              Write-Error "Failed to obtain Tailscale IPv4 address."
+              exit 1
+          }
+
+
+          # ========================================================
+          # Display connection information
+          # ========================================================
 
           Write-Host ""
-          Write-Host "=============================="
-          Write-Host "TAILSCALE IP"
-          Write-Host "=============================="
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "             TAILSCALE CONNECTED" -ForegroundColor Cyan
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host ""
 
+          Write-Host "Hostname       : $Hostname" -ForegroundColor Yellow
+          Write-Host "Tailscale IPv4 : $ts_ip" -ForegroundColor Yellow
+          Write-Host "Exit Node       : ADVERTISED" -ForegroundColor Green
+
+          Write-Host ""
+
+          Write-Host "RDP Username    : NvDAdmin" -ForegroundColor Yellow
+          Write-Host "RDP Password    : GitHub Secret RDP_PASSWORD" -ForegroundColor Yellow
+
+          Write-Host ""
+
+          Write-Host "==================================================" -ForegroundColor Green
+
+
+          # ========================================================
+          # Tailscale Status
+          # ========================================================
+
+          Write-Host ""
+          Write-Host "Tailscale status:"
+          & $Tailscale status
+
+          if ($LASTEXITCODE -ne 0) {
+
+              Write-Error "Tailscale status command failed."
+              exit 1
+          }
+
+
+          # ========================================================
+          # Tailscale IPv4
+          # ========================================================
+
+          Write-Host ""
+          Write-Host "Tailscale IPv4:"
+          & $Tailscale ip -4
+
+
+      # ============================================================
+      # 5. Verify Tailscale / Exit Node
+      # ============================================================
+      - name: 5. Verify Exit Node
+        shell: pwsh
+        run: |
+
+          $Tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $Tailscale)) {
+
+              Write-Error "Tailscale executable not found."
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host "          VERIFYING TAILSCALE" -ForegroundColor Cyan
+          Write-Host "==================================================" -ForegroundColor Cyan
+
+
+          # ========================================================
+          # Status
+          # ========================================================
+
+          Write-Host ""
+          Write-Host "Tailscale status:"
+          & $Tailscale status
+
+          if ($LASTEXITCODE -ne 0) {
+
+              Write-Error "Tailscale status verification failed."
+              exit 1
+          }
+
+
+          # ========================================================
+          # IPv4
+          # ========================================================
+
+          Write-Host ""
+          Write-Host "Tailscale IP:"
+
+          $VerifyIP = (
+            & $Tailscale ip -4 |
+            Select-Object -First 1
+          ).Trim()
+
+          if (-not $VerifyIP) {
+
+              Write-Error "Tailscale IPv4 verification failed."
+              exit 1
+          }
+
+          Write-Host $VerifyIP -ForegroundColor Green
+
+
+          # ========================================================
+          # Preferences
+          # ========================================================
+
+          Write-Host ""
+          Write-Host "Tailscale preferences:"
+          & $Tailscale debug prefs
+
+          if ($LASTEXITCODE -ne 0) {
+
+              Write-Error "Tailscale preferences check failed."
+              exit 1
+          }
+
+
+          # ========================================================
+          # Verify Exit Node advertisement
+          # ========================================================
+
+          Write-Host ""
+          Write-Host "Checking Exit Node advertisement..."
+
+          $Prefs = & $Tailscale debug prefs | Out-String
+
+          if (
+              ($Prefs -match '"AdvertiseRoutes"') -and
+              ($Prefs -match '0\.0\.0\.0/0')
+          ) {
+
+              Write-Host ""
+              Write-Host "Exit Node advertisement detected." -ForegroundColor Green
+
+          }
+          else {
+
+              Write-Error "Exit Node advertisement was not detected."
+              exit 1
+          }
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "       EXIT NODE VERIFICATION PASSED" -ForegroundColor Green
+          Write-Host "==================================================" -ForegroundColor Green
+
+
+      # ============================================================
+      # 6. Keep Runner Alive
+      # ============================================================
+      - name: 6. Keep Server Alive
+        shell: pwsh
+        run: |
+
+          $Tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "          SERVER IS NOW ONLINE" -ForegroundColor Cyan
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host ""
+
+          Write-Host "Runner ID:"
+          Write-Host $env:GITHUB_RUN_ID -ForegroundColor Yellow
+
+          Write-Host ""
+          Write-Host "Runner Name:"
+          Write-Host "github-rdp-$env:GITHUB_RUN_ID" -ForegroundColor Yellow
+
+          Write-Host ""
+          Write-Host "Runner will remain online for approximately:"
+          Write-Host "5 hours and 45 minutes"
+
+          Write-Host ""
+          Write-Host "A new Runner should start approximately"
+          Write-Host "5 hours after this scheduled cycle."
+
+          Write-Host ""
+          Write-Host "Tailscale IPv4:"
           & $Tailscale ip -4
 
           Write-Host ""
-          Write-Host "=============================="
-          Write-Host "TAILSCALE PREFS"
-          Write-Host "=============================="
+          Write-Host "Tailscale status:"
+          & $Tailscale status
 
-          & $Tailscale debug prefs
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
 
 
-      # -------------------------
-      # Keep Runner Alive
-      # -------------------------
-      - name: Keep Runner Alive
-        shell: powershell
-        run: |
-          Write-Host "Windows Runner is now active."
-          Write-Host "Tailscale Exit Node is enabled."
-          Write-Host "Runner ID: $env:GITHUB_RUN_ID"
-          Write-Host "Keeping runner alive for 345 minutes..."
+          # ==========================================================
+          # 345 minutes = 5 hours 45 minutes
+          # ==========================================================
 
           for ($i = 1; $i -le 345; $i++) {
-              Write-Host "[$i/345] Runner alive..."
+
+              if (($i % 10) -eq 0) {
+
+                  Write-Host ""
+                  Write-Host "[$i/345] Server running..." -ForegroundColor Cyan
+
+                  Write-Host ""
+                  Write-Host "Tailscale IPv4:"
+                  & $Tailscale ip -4
+
+                  Write-Host ""
+                  Write-Host "Tailscale status:"
+                  & $Tailscale status
+              }
+              else {
+
+                  Write-Host "[$i/345] Server running..."
+              }
+
               Start-Sleep -Seconds 60
           }
+
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Yellow
+          Write-Host "       SERVER LIFETIME REACHED" -ForegroundColor Yellow
+          Write-Host "       ENDING THIS RUNNER..." -ForegroundColor Yellow
+          Write-Host "==================================================" -ForegroundColor Yellow
